@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import datetime, timezone
 
 import requests
@@ -37,16 +38,20 @@ def fetch_tbmm_list():
 
 def parse_basic_offers(html: str):
     soup = BeautifulSoup(html, "html.parser")
-
     offers = []
 
+    # 1) Önce klasik linkleri topla
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
         text = a.get_text(" ", strip=True)
 
-        if "/Yasama/KanunTeklifi/" in href and text:
+        if "/Yasama/KanunTeklifi/" in href:
             full_url = href if href.startswith("http") else f"https://www.tbmm.gov.tr{href}"
             tbmm_id = full_url.rstrip("/").split("/")[-1]
+
+            # Başlık boşsa sonradan URL'den gelmesin diye atla
+            if not text:
+                text = "TBMM Kanun Teklifi"
 
             offers.append({
                 "tbmmId": tbmm_id,
@@ -54,11 +59,35 @@ def parse_basic_offers(html: str):
                 "sourceUrl": full_url,
             })
 
+    # 2) Sayfa JS / gömülü içerikte link barındırıyorsa regex ile de tara
+    html_matches = re.findall(
+        r"https://www\.tbmm\.gov\.tr/Yasama/KanunTeklifi/([a-zA-Z0-9\-]+)",
+        html,
+    )
+
+    for tbmm_id in html_matches:
+        full_url = f"https://www.tbmm.gov.tr/Yasama/KanunTeklifi/{tbmm_id}"
+        offers.append({
+            "tbmmId": tbmm_id,
+            "title": "TBMM Kanun Teklifi",
+            "sourceUrl": full_url,
+        })
+
+    # 3) Duplicate temizliği
     unique = {}
     for item in offers:
         unique[item["tbmmId"]] = item
 
-    return list(unique.values())
+    result = list(unique.values())
+
+    # Debug için kısa bilgi bas
+    print(f"Found raw offers: {len(result)}")
+    if result:
+        print("Sample offers:")
+        for item in result[:5]:
+            print(f"- {item['tbmmId']} | {item['title']}")
+
+    return result
 
 
 def upsert_laws(db, offers):
