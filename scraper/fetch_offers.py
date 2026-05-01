@@ -8,8 +8,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 
 
-TBMM_LIST_URL = "https://www.tbmm.gov.tr/yasama/kanun-teklifleri"
-
+TBMM_LIST_URL = "https://www.tbmm.gov.tr/develop/owa/kanun_teklifi_sd.sorgu_baslangic"
 
 def init_firestore():
     service_account_path = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
