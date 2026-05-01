@@ -37,11 +37,26 @@ def fetch_tbmm_list():
 
 
 def parse_basic_offers(html: str):
+    print("HTML length:", len(html))
+    print("HTML first 1000 chars:")
+    print(html[:1000])
+
     soup = BeautifulSoup(html, "html.parser")
+
+    all_links = soup.find_all("a", href=True)
+    print("Total <a> tags found:", len(all_links))
+
+    print("First 30 href values:")
+    for a in all_links[:30]:
+        try:
+            print("-", a["href"])
+        except Exception:
+            pass
+
     offers = []
 
-    # 1) Önce klasik linkleri topla
-    for a in soup.find_all("a", href=True):
+    # 1) Linklerden yakalamaya çalış
+    for a in all_links:
         href = a["href"].strip()
         text = a.get_text(" ", strip=True)
 
@@ -49,7 +64,6 @@ def parse_basic_offers(html: str):
             full_url = href if href.startswith("http") else f"https://www.tbmm.gov.tr{href}"
             tbmm_id = full_url.rstrip("/").split("/")[-1]
 
-            # Başlık boşsa sonradan URL'den gelmesin diye atla
             if not text:
                 text = "TBMM Kanun Teklifi"
 
@@ -59,11 +73,13 @@ def parse_basic_offers(html: str):
                 "sourceUrl": full_url,
             })
 
-    # 2) Sayfa JS / gömülü içerikte link barındırıyorsa regex ile de tara
+    # 2) Ham HTML içinden regex ile ara
     html_matches = re.findall(
         r"https://www\.tbmm\.gov\.tr/Yasama/KanunTeklifi/([a-zA-Z0-9\-]+)",
         html,
     )
+
+    print("Regex matches found:", len(html_matches))
 
     for tbmm_id in html_matches:
         full_url = f"https://www.tbmm.gov.tr/Yasama/KanunTeklifi/{tbmm_id}"
@@ -73,14 +89,12 @@ def parse_basic_offers(html: str):
             "sourceUrl": full_url,
         })
 
-    # 3) Duplicate temizliği
     unique = {}
     for item in offers:
         unique[item["tbmmId"]] = item
 
     result = list(unique.values())
 
-    # Debug için kısa bilgi bas
     print(f"Found raw offers: {len(result)}")
     if result:
         print("Sample offers:")
