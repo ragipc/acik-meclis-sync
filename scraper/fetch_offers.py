@@ -2,6 +2,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
+from urllib.parse import urlparse, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
@@ -9,7 +10,6 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 
 
-# Sonuç sayfası için yedekli adresler
 TBMM_LIST_URLS = [
     "https://www5.tbmm.gov.tr/develop/owa/tasari_teklif_sd.sorgu_sonuc?bulunan_kayit=3278&icerik_arama=&kullanici_id=18731517&metin_arama=&sonuc_sira=340&taksim_no=0",
     "https://www.tbmm.gov.tr/develop/owa/tasari_teklif_sd.sorgu_sonuc?bulunan_kayit=3278&icerik_arama=&kullanici_id=18731517&metin_arama=&sonuc_sira=340&taksim_no=0",
@@ -58,54 +58,48 @@ def fetch_tbmm_list():
     raise RuntimeError(f"All TBMM URLs failed. Last error: {last_error}")
 
 
-def parse_basic_offers(html: str):
-    print("HTML length:", len(html))
+def extract_kanunlar_sira_no(url: str):
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    values = query.get("kanunlar_sira_no")
+    if values and values[0].strip():
+        return values[0].strip()
+    return None
 
+
+def parse_basic_offers(html: str):
     soup = BeautifulSoup(html, "html.parser")
     offers = []
 
     all_links = soup.find_all("a", href=True)
     print("Total <a> tags found:", len(all_links))
 
-    print("First 30 href values:")
-    for a in all_links[:30]:
-        try:
-            print("-", a["href"])
-        except Exception:
-            pass
-
+    # SADECE gerçek teklif kayıtlarını temsil eden
+    # "Diğer Bilgiler..." linklerini alıyoruz.
     for a in all_links:
         href = a["href"].strip()
         text = a.get_text(" ", strip=True)
 
-        href_lower = href.lower()
-        text_lower = text.lower()
+        if "tasari_teklif_sd.onerge_bilgileri" not in href.lower():
+            continue
 
-        if (
-            "tasari_teklif" in href_lower
-            or "kanun_teklifi" in href_lower
-            or "kanunteklifi" in href_lower
-            or "metni" in text_lower
-            or "özet" in text_lower
-            or "ozet" in text_lower
-            or "detay" in text_lower
-        ):
-            # Mutlak URL üret
-            if href.startswith("http"):
-                full_url = href
-            elif href.startswith("/"):
-                full_url = f"https://www5.tbmm.gov.tr{href}"
-            else:
-                full_url = f"https://www5.tbmm.gov.tr/{href}"
+        kanunlar_sira_no = extract_kanunlar_sira_no(href)
+        if not kanunlar_sira_no:
+            continue
 
-            tbmm_id = re.sub(r"[^a-zA-Z0-9]+", "_", full_url).strip("_")
-            title = text if text else "TBMM Kanun Teklifi"
+        if href.startswith("http"):
+            full_url = href
+        elif href.startswith("/"):
+            full_url = f"https://www5.tbmm.gov.tr{href}"
+        else:
+            full_url = f"https://www5.tbmm.gov.tr/{href}"
 
-            offers.append({
-                "tbmmId": tbmm_id,
-                "title": title,
-                "sourceUrl": full_url,
-            })
+        offers.append({
+            "tbmmId": f"tbmm_{kanunlar_sira_no}",
+            "title": f"TBMM Kanun Teklifi {kanunlar_sira_no}",
+            "sourceUrl": full_url,
+            "kanunlarSiraNo": kanunlar_sira_no,
+        })
 
     unique = {}
     for item in offers:
@@ -113,11 +107,11 @@ def parse_basic_offers(html: str):
 
     result = list(unique.values())
 
-    print(f"Found raw offers: {len(result)}")
+    print(f"Found filtered offers: {len(result)}")
     if result:
         print("Sample offers:")
         for item in result[:10]:
-            print(f"- {item['tbmmId']} | {item['title']} | {item['sourceUrl']}")
+            print(f"- {item['tbmmId']} | {item['sourceUrl']}")
 
     return result
 
@@ -131,6 +125,7 @@ def upsert_laws(db, offers):
 
         payload = {
             "tbmmId": offer["tbmmId"],
+            "kanunlarSiraNo": offer["kanunlarSiraNo"],
             "title": offer["title"],
             "summary": "",
             "content": "",
@@ -142,6 +137,7 @@ def upsert_laws(db, offers):
             "publishedAt": now,
             "lastSyncedAt": now,
             "isActive": True,
+            "createdBy": "tbmm_sync_bot",
         }
 
         if existing.exists:
@@ -149,14 +145,15 @@ def upsert_laws(db, offers):
                 {
                     "title": offer["title"],
                     "sourceUrl": offer["sourceUrl"],
+                    "kanunlarSiraNo": offer["kanunlarSiraNo"],
                     "lastSyncedAt": now,
                 },
                 merge=True,
             )
-            print(f"UPDATED: {offer['tbmmId']} - {offer['title']}")
+            print(f"UPDATED: {offer['tbmmId']}")
         else:
             doc_ref.set(payload)
-            print(f"CREATED: {offer['tbmmId']} - {offer['title']}")
+            print(f"CREATED: {offer['tbmmId']}")
 
 
 def main():
@@ -165,7 +162,7 @@ def main():
     offers = parse_basic_offers(html)
 
     if not offers:
-        print("No offers found.")
+        print("No filtered offers found.")
         return
 
     upsert_laws(db, offers)
