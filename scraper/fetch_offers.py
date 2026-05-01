@@ -1,5 +1,6 @@
 import os
 import re
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -8,8 +9,11 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 
 
-# Geçici olarak doğrudan sonuç sayfasını hedefliyoruz
-TBMM_LIST_URL = "https://www.tbmm.gov.tr/develop/owa/tasari_teklif_sd.sorgu_sonuc?bulunan_kayit=3278&icerik_arama=&kullanici_id=18731517&metin_arama=&sonuc_sira=340&taksim_no=0"
+# Sonuç sayfası için yedekli adresler
+TBMM_LIST_URLS = [
+    "https://www5.tbmm.gov.tr/develop/owa/tasari_teklif_sd.sorgu_sonuc?bulunan_kayit=3278&icerik_arama=&kullanici_id=18731517&metin_arama=&sonuc_sira=340&taksim_no=0",
+    "https://www.tbmm.gov.tr/develop/owa/tasari_teklif_sd.sorgu_sonuc?bulunan_kayit=3278&icerik_arama=&kullanici_id=18731517&metin_arama=&sonuc_sira=340&taksim_no=0",
+]
 
 
 def init_firestore():
@@ -26,15 +30,32 @@ def init_firestore():
 
 
 def fetch_tbmm_list():
-    response = requests.get(
-        TBMM_LIST_URL,
-        timeout=30,
-        headers={
-            "User-Agent": "Mozilla/5.0 (compatible; AcikMeclisBot/1.0)"
-        },
-    )
-    response.raise_for_status()
-    return response.text
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; AcikMeclisBot/1.0)"
+    }
+
+    last_error = None
+
+    for url in TBMM_LIST_URLS:
+        print(f"Trying URL: {url}")
+
+        for attempt in range(1, 4):
+            try:
+                print(f"Attempt {attempt} for {url}")
+                response = requests.get(
+                    url,
+                    timeout=60,
+                    headers=headers,
+                )
+                response.raise_for_status()
+                print(f"Success with URL: {url}")
+                return response.text
+            except requests.RequestException as e:
+                last_error = e
+                print(f"Request failed on attempt {attempt}: {e}")
+                time.sleep(3)
+
+    raise RuntimeError(f"All TBMM URLs failed. Last error: {last_error}")
 
 
 def parse_basic_offers(html: str):
@@ -46,6 +67,13 @@ def parse_basic_offers(html: str):
     all_links = soup.find_all("a", href=True)
     print("Total <a> tags found:", len(all_links))
 
+    print("First 30 href values:")
+    for a in all_links[:30]:
+        try:
+            print("-", a["href"])
+        except Exception:
+            pass
+
     for a in all_links:
         href = a["href"].strip()
         text = a.get_text(" ", strip=True)
@@ -53,7 +81,6 @@ def parse_basic_offers(html: str):
         href_lower = href.lower()
         text_lower = text.lower()
 
-        # Teklif / tasarı / metin / özet / detay linklerini daha esnek yakala
         if (
             "tasari_teklif" in href_lower
             or "kanun_teklifi" in href_lower
@@ -63,11 +90,15 @@ def parse_basic_offers(html: str):
             or "ozet" in text_lower
             or "detay" in text_lower
         ):
-            full_url = href if href.startswith("http") else f"https://www.tbmm.gov.tr{href}"
+            # Mutlak URL üret
+            if href.startswith("http"):
+                full_url = href
+            elif href.startswith("/"):
+                full_url = f"https://www5.tbmm.gov.tr{href}"
+            else:
+                full_url = f"https://www5.tbmm.gov.tr/{href}"
 
-            # URL'den güvenli document id üret
             tbmm_id = re.sub(r"[^a-zA-Z0-9]+", "_", full_url).strip("_")
-
             title = text if text else "TBMM Kanun Teklifi"
 
             offers.append({
