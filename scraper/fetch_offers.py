@@ -3,9 +3,11 @@ import re
 import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs
+from io import BytesIO
 
 import requests
 from bs4 import BeautifulSoup
+from pypdf import PdfReader
 import firebase_admin
 from firebase_admin import credentials, firestore
 
@@ -52,6 +54,27 @@ def request_with_retry(url: str, timeout: int = 60, attempts: int = 3) -> str:
             time.sleep(3)
 
     raise RuntimeError(f"Request failed for {url}. Last error: {last_error}")
+
+
+def fetch_binary_with_retry(url: str, timeout: int = 90, attempts: int = 3) -> bytes:
+    last_error = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            print(f"Downloading binary: {url} | attempt {attempt}")
+            response = requests.get(
+                url,
+                timeout=timeout,
+                headers=REQUEST_HEADERS,
+            )
+            response.raise_for_status()
+            return response.content
+        except requests.RequestException as e:
+            last_error = e
+            print(f"Binary request failed: {e}")
+            time.sleep(3)
+
+    raise RuntimeError(f"Binary download failed for {url}. Last error: {last_error}")
 
 
 def fetch_tbmm_list():
@@ -179,7 +202,6 @@ def pick_title_from_lines(lines):
         if len(t) < 10:
             continue
 
-        # Çok teknik / alakasız satırları ele
         if re.fullmatch(r"[0-9/ .-]+", t):
             continue
 
@@ -188,7 +210,6 @@ def pick_title_from_lines(lines):
     if not candidates:
         return ""
 
-    # En anlamlı başlık genelde uzun ve açıklayıcı olur
     candidates.sort(key=len, reverse=True)
     return candidates[0]
 
@@ -222,7 +243,6 @@ def parse_basic_offers(html: str):
 
         detail_url = normalize_url(href)
 
-        # En yakın satır / blok
         container = a.find_parent("tr")
         if container is None:
             container = a.find_parent("table")
@@ -240,7 +260,6 @@ def parse_basic_offers(html: str):
 
         status, status_label = map_status(last_status_text)
 
-        # Başlık hiç çıkmazsa güvenli fallback
         if not title:
             title = f"TBMM Kanun Teklifi {kanunlar_sira_no}"
 
@@ -277,11 +296,83 @@ def parse_basic_offers(html: str):
     return result
 
 
+def extract_text_from_pdf(pdf_url: str):
+    if not pdf_url:
+        return ""
+
+    try:
+        pdf_bytes = fetch_binary_with_retry(pdf_url, timeout=90, attempts=2)
+        reader = PdfReader(BytesIO(pdf_bytes))
+        text_parts = []
+
+        # İlk 2 sayfa çoğu zaman yeterli
+        page_count = min(2, len(reader.pages))
+        for i in range(page_count):
+            try:
+                page_text = reader.pages[i].extract_text() or ""
+                if page_text.strip():
+                    text_parts.append(page_text)
+            except Exception as e:
+                print(f"PDF page extract error ({pdf_url}, page {i}): {e}")
+
+        text = "\n".join(text_parts)
+        return clean_text(text)
+    except Exception as e:
+        print(f"PDF extract failed for {pdf_url}: {e}")
+        return ""
+
+
+def parse_pdf_fields(pdf_text: str):
+    if not pdf_text:
+        return {
+            "pdfTitle": "",
+            "pdfSubmittedAtText": "",
+            "pdfEsasNo": "",
+        }
+
+    lines = [clean_text(x) for x in pdf_text.split("\n") if clean_text(x)]
+
+    # Başlık için ilk güçlü satırlardan birini seç
+    pdf_title = ""
+    for line in lines[:20]:
+        lower = line.lower()
+
+        if len(line) < 15:
+            continue
+        if "türkiye büyük millet meclisi" in lower:
+            continue
+        if "kanun teklifi" in lower and len(line) < 25:
+            continue
+        if "esas no" in lower or "başkanlığa geliş tarihi" in lower:
+            continue
+
+        pdf_title = line
+        break
+
+    pdf_submitted = ""
+    for line in lines[:40]:
+        if "başkanlığa geliş tarihi" in line.lower():
+            maybe_date = try_extract_date(line)
+            if maybe_date:
+                pdf_submitted = maybe_date
+                break
+
+    pdf_esas_no = ""
+    for line in lines[:40]:
+        if "esas no" in line.lower() or "esas numarası" in line.lower():
+            m = re.search(r"([0-9/ -]+)", line)
+            if m:
+                pdf_esas_no = clean_text(m.group(1))
+                break
+
+    return {
+        "pdfTitle": pdf_title,
+        "pdfSubmittedAtText": pdf_submitted,
+        "pdfEsasNo": pdf_esas_no,
+    }
+
+
 def enrich_offer_with_detail_page(offer: dict):
-    """
-    Detay sayfası güvenilir değil, ama bazen PDF linki gibi ek bilgi verebilir.
-    Bu yüzden yalnızca eksik alanları tamamlamak için kullanıyoruz.
-    """
     try:
         detail_html = request_with_retry(offer["sourceUrl"], timeout=60, attempts=2)
         soup = BeautifulSoup(detail_html, "html.parser")
@@ -294,19 +385,36 @@ def enrich_offer_with_detail_page(offer: dict):
                     offer["pdfUrl"] = normalize_url(href)
                     break
 
-        # Çok generic başlık kaldıysa title tag veya metinden bir şey dene
-        current_title = offer.get("title", "")
-        if current_title.startswith("TBMM Kanun Teklifi"):
-            full_text = clean_text(soup.get_text("\n", strip=True))
-            lines = [clean_text(x) for x in full_text.split("\n") if clean_text(x)]
-            maybe_title = pick_title_from_lines(lines)
-            if maybe_title and "tbmm kanun teklifi" not in maybe_title.lower():
-                offer["title"] = maybe_title
-
         return offer
     except Exception as e:
         print(f"DETAIL PAGE WARNING for {offer['tbmmId']}: {e}")
         return offer
+
+
+def apply_pdf_enrichment(offer: dict):
+    pdf_url = offer.get("pdfUrl", "")
+    if not pdf_url:
+        return offer
+
+    pdf_text = extract_text_from_pdf(pdf_url)
+    pdf_fields = parse_pdf_fields(pdf_text)
+
+    # Başlık generic ise PDF başlığını tercih et
+    current_title = offer.get("title", "")
+    if current_title.startswith("TBMM Kanun Teklifi") and pdf_fields["pdfTitle"]:
+        offer["title"] = pdf_fields["pdfTitle"]
+
+    if not offer.get("submittedAtText") and pdf_fields["pdfSubmittedAtText"]:
+        offer["submittedAtText"] = pdf_fields["pdfSubmittedAtText"]
+
+    if not offer.get("esasNo") and pdf_fields["pdfEsasNo"]:
+        offer["esasNo"] = pdf_fields["pdfEsasNo"]
+
+    # Özet boşsa PDF ilk 400 karakterden kısa özet üret
+    if not offer.get("summary") and pdf_text:
+        offer["summary"] = pdf_text[:400]
+
+    return offer
 
 
 def upsert_laws(db, offers):
@@ -314,6 +422,7 @@ def upsert_laws(db, offers):
 
     for offer in offers:
         enriched = enrich_offer_with_detail_page(offer)
+        enriched = apply_pdf_enrichment(enriched)
 
         doc_ref = db.collection("laws").document(enriched["tbmmId"])
         existing = doc_ref.get()
