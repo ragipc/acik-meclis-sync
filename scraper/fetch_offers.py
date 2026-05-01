@@ -8,7 +8,9 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 
 
-TBMM_LIST_URL = "https://www.tbmm.gov.tr/develop/owa/kanun_teklifi_sd.sorgu_baslangic"
+# Geçici olarak doğrudan sonuç sayfasını hedefliyoruz
+TBMM_LIST_URL = "https://www.tbmm.gov.tr/develop/owa/tasari_teklif_sd.sorgu_sonuc?bulunan_kayit=3278&icerik_arama=&kullanici_id=18731517&metin_arama=&sonuc_sira=340&taksim_no=0"
+
 
 def init_firestore():
     service_account_path = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
@@ -37,56 +39,42 @@ def fetch_tbmm_list():
 
 def parse_basic_offers(html: str):
     print("HTML length:", len(html))
-    print("HTML first 1000 chars:")
-    print(html[:1000])
 
     soup = BeautifulSoup(html, "html.parser")
+    offers = []
 
     all_links = soup.find_all("a", href=True)
     print("Total <a> tags found:", len(all_links))
 
-    print("First 30 href values:")
-    for a in all_links[:30]:
-        try:
-            print("-", a["href"])
-        except Exception:
-            pass
-
-    offers = []
-
-    # 1) Linklerden yakalamaya çalış
     for a in all_links:
         href = a["href"].strip()
         text = a.get_text(" ", strip=True)
 
-        if "/Yasama/KanunTeklifi/" in href:
-            full_url = href if href.startswith("http") else f"https://www.tbmm.gov.tr{href}"
-            tbmm_id = full_url.rstrip("/").split("/")[-1]
+        href_lower = href.lower()
+        text_lower = text.lower()
 
-            if not text:
-                text = "TBMM Kanun Teklifi"
+        # Teklif / tasarı / metin / özet / detay linklerini daha esnek yakala
+        if (
+            "tasari_teklif" in href_lower
+            or "kanun_teklifi" in href_lower
+            or "kanunteklifi" in href_lower
+            or "metni" in text_lower
+            or "özet" in text_lower
+            or "ozet" in text_lower
+            or "detay" in text_lower
+        ):
+            full_url = href if href.startswith("http") else f"https://www.tbmm.gov.tr{href}"
+
+            # URL'den güvenli document id üret
+            tbmm_id = re.sub(r"[^a-zA-Z0-9]+", "_", full_url).strip("_")
+
+            title = text if text else "TBMM Kanun Teklifi"
 
             offers.append({
                 "tbmmId": tbmm_id,
-                "title": text,
+                "title": title,
                 "sourceUrl": full_url,
             })
-
-    # 2) Ham HTML içinden regex ile ara
-    html_matches = re.findall(
-        r"https://www\.tbmm\.gov\.tr/Yasama/KanunTeklifi/([a-zA-Z0-9\-]+)",
-        html,
-    )
-
-    print("Regex matches found:", len(html_matches))
-
-    for tbmm_id in html_matches:
-        full_url = f"https://www.tbmm.gov.tr/Yasama/KanunTeklifi/{tbmm_id}"
-        offers.append({
-            "tbmmId": tbmm_id,
-            "title": "TBMM Kanun Teklifi",
-            "sourceUrl": full_url,
-        })
 
     unique = {}
     for item in offers:
@@ -97,8 +85,8 @@ def parse_basic_offers(html: str):
     print(f"Found raw offers: {len(result)}")
     if result:
         print("Sample offers:")
-        for item in result[:5]:
-            print(f"- {item['tbmmId']} | {item['title']}")
+        for item in result[:10]:
+            print(f"- {item['tbmmId']} | {item['title']} | {item['sourceUrl']}")
 
     return result
 
