@@ -39,7 +39,7 @@ DISCOVERY_QUERIES = [
 ]
 
 REQUEST_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; AcikMeclisBot/2.2; +https://github.com/)",
+    "User-Agent": "Mozilla/5.0 (compatible; AcikMeclisBot/2.3; +https://github.com/)",
     "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.7",
 }
 
@@ -64,11 +64,9 @@ def clean_text(value: str) -> str:
 def normalize_turkish_for_search(value: str) -> str:
     text = clean_text(value)
     text = unicodedata.normalize("NFKC", text)
-
     text = text.replace("i̇", "i")
     text = text.replace("İ", "i")
     text = text.replace("I", "ı")
-
     return text.lower()
 
 
@@ -99,7 +97,6 @@ def normalize_detail_url(url: str) -> str:
     url = url.split("?")[0]
     url = url.replace("http://", "https://")
     url = url.replace("https://tbmm.gov.tr/", "https://www.tbmm.gov.tr/")
-
     return url.strip()
 
 
@@ -169,7 +166,6 @@ def discover_new_tbmm_detail_urls(max_urls: int = 40) -> list[str]:
         unique.append(normalized)
 
     print(f"Total unique new TBMM detail URLs discovered: {len(unique)}")
-
     return unique[:max_urls]
 
 
@@ -303,101 +299,64 @@ def build_what_changes(summary: str, category: str) -> str:
     if "eğitim" in category_key or "egitim" in category_key:
         if "öğrenci affı" in summary_key or "ogrenci affi" in summary_key:
             return (
-                "Bu teklif, yükseköğretim kurumlarıyla ilişiği kesilmiş öğrencilerin "
-                "yeniden eğitimlerine dönebilmesi için mevcut yükseköğretim düzeninde "
-                "değişiklik yapılmasını öngörmektedir."
-            )
-
-        if "yükseköğretim" in summary_key or "yuksekogretim" in summary_key:
-            return (
-                "Bu teklif, yükseköğretim sistemiyle ilgili mevcut kurallarda değişiklik "
-                "yapılmasını amaçlamaktadır. Düzenleme öğrencileri, üniversiteleri veya "
-                "eğitim süreçlerini etkileyebilir."
+                "Mevcut durumda:\n"
+                "Yükseköğretim kurumlarıyla ilişiği kesilen öğrenciler, mevcut kurallara göre eğitimlerine devam edemeyebiliyor.\n\n"
+                "Teklif kabul edilirse:\n"
+                "Bu öğrencilere yeniden kayıt yaptırma ve eğitimlerine devam etme imkânı tanınabilir."
             )
 
         return (
-            "Bu teklif, eğitim alanındaki mevcut kurallarda değişiklik yapılmasını "
-            "öngörmektedir. Düzenlemenin öğrenciler, öğretmenler, veliler veya eğitim "
-            "kurumları üzerinde etkileri olabilir."
+            "Mevcut durumda:\n"
+            "Eğitim alanındaki mevcut kurallar, bazı öğrenciler veya eğitim kurumları için sınırlayıcı sonuçlar doğurabiliyor.\n\n"
+            "Teklif kabul edilirse:\n"
+            "Eğitim sistemiyle ilgili bazı haklar, süreçler veya kurumların işleyişi yeniden düzenlenebilir."
         )
 
     if "çalışma" in category_key or "calisma" in category_key or "sosyal politika" in category_key:
         if "eşit değerde işe eşit ücret" in summary_key or "esit degerde ise esit ucret" in summary_key:
             return (
-                "Bu teklif, eşit değerde işe eşit ücret ilkesinin uygulanmasını denetleyecek "
-                "bir kurum kurulmasını ve bu kurumun görev, yetki ve teşkilat yapısının "
-                "belirlenmesini öngörmektedir."
+                "Mevcut durumda:\n"
+                "Eşit değerde iş yapan kişiler arasında ücret farkları konusunda özel bir denetim yapısı yeterince belirgin olmayabilir.\n\n"
+                "Teklif kabul edilirse:\n"
+                "Eşit değerde işe eşit ücret ilkesini denetleyecek özel bir kurum kurulması ve bu kurumun görevlerinin belirlenmesi amaçlanır."
             )
 
         return (
-            "Bu teklif, çalışma hayatı veya sosyal politika alanındaki mevcut kurallarda "
-            "değişiklik yapılmasını amaçlamaktadır. Ücret, istihdam, sosyal yardım veya "
-            "çalışan haklarıyla ilgili süreçleri etkileyebilir."
+            "Mevcut durumda:\n"
+            "Çalışma hayatı ve sosyal politika alanındaki bazı haklar veya uygulamalar mevcut kanunlarla sınırlı şekilde yürütülüyor.\n\n"
+            "Teklif kabul edilirse:\n"
+            "Çalışanlar, işverenler, ücret politikaları veya sosyal haklarla ilgili bazı süreçler yeniden düzenlenebilir."
         )
 
     if "ekonomi" in category_key:
         return (
-            "Bu teklif, ekonomiyle ilgili mevcut düzenlemelerde değişiklik yapılmasını "
-            "öngörmektedir. Vergi, gelir, destek, bütçe veya işletmelerle ilgili süreçleri "
-            "etkileyebilir."
+            "Mevcut durumda:\n"
+            "Ekonomiyle ilgili mevcut kurallar vergi, destek, bütçe veya işletme süreçlerini belirli sınırlar içinde düzenliyor.\n\n"
+            "Teklif kabul edilirse:\n"
+            "Vergiler, ekonomik destekler, kamu bütçesi veya ticari faaliyetlerle ilgili bazı kurallar değişebilir."
         )
 
     if "sağlık" in category_key or "saglik" in category_key:
         return (
-            "Bu teklif, sağlık alanındaki mevcut düzenlemelerde değişiklik yapılmasını "
-            "öngörmektedir. Sağlık hizmetleri, hastalar, sağlık çalışanları veya kurumlar "
-            "üzerinde etkiler doğurabilir."
+            "Mevcut durumda:\n"
+            "Sağlık hizmetleri ve sağlık kurumları mevcut mevzuata göre yürütülüyor.\n\n"
+            "Teklif kabul edilirse:\n"
+            "Hastalar, sağlık çalışanları, hastaneler veya sağlık hizmetlerine erişimle ilgili bazı kurallar değişebilir."
         )
 
     if "adalet" in category_key:
         return (
-            "Bu teklif, hukuk ve adalet alanındaki mevcut kurallarda değişiklik yapılmasını "
-            "öngörmektedir. Mahkeme süreçleri, hak arama yolları veya hukuki yükümlülükler "
-            "üzerinde etkiler doğurabilir."
-        )
-
-    if "tarım" in category_key or "tarim" in category_key:
-        return (
-            "Bu teklif, tarım ve kırsal üretimle ilgili mevcut düzenlemelerde değişiklik "
-            "yapılmasını öngörmektedir. Çiftçiler, üreticiler veya tarımsal faaliyetler "
-            "üzerinde etkiler doğurabilir."
-        )
-
-    if "enerji" in category_key:
-        return (
-            "Bu teklif, enerji alanındaki mevcut düzenlemelerde değişiklik yapılmasını "
-            "öngörmektedir. Elektrik, doğalgaz, maden veya enerji piyasasıyla ilgili "
-            "süreçleri etkileyebilir."
-        )
-
-    if (
-        "ulaşım" in category_key
-        or "ulasim" in category_key
-        or "iletişim" in category_key
-        or "iletisim" in category_key
-    ):
-        return (
-            "Bu teklif, ulaşım veya iletişim alanındaki mevcut düzenlemelerde değişiklik "
-            "yapılmasını öngörmektedir. Trafik, araçlar, haberleşme veya altyapı süreçleri "
-            "üzerinde etkiler doğurabilir."
-        )
-
-    if (
-        "çevre" in category_key
-        or "cevre" in category_key
-        or "şehircilik" in category_key
-        or "sehircilik" in category_key
-    ):
-        return (
-            "Bu teklif, çevre, şehircilik veya imar alanındaki mevcut düzenlemelerde "
-            "değişiklik yapılmasını öngörmektedir. Yerel yönetimler, yaşam alanları veya "
-            "çevresel süreçler üzerinde etkiler doğurabilir."
+            "Mevcut durumda:\n"
+            "Hukuk ve adalet alanındaki süreçler mevcut kanunlara göre yürütülüyor.\n\n"
+            "Teklif kabul edilirse:\n"
+            "Mahkeme süreçleri, hak arama yolları, cezai hükümler veya hukuki yükümlülüklerde değişiklik yapılabilir."
         )
 
     return (
-        "Bu teklif, ilgili alandaki mevcut kanun veya kurallarda değişiklik yapılmasını "
-        "öngörmektedir. Ayrıntılı değişikliklerin kesin olarak anlaşılması için resmî "
-        "kanun teklifi metni kontrol edilmelidir."
+        "Mevcut durumda:\n"
+        "Bu konudaki süreçler mevcut kanun ve kurallara göre yürütülmektedir.\n\n"
+        "Teklif kabul edilirse:\n"
+        "İlgili alandaki mevcut kurallarda değişiklik yapılabilir. Kesin değişiklikleri anlamak için resmî teklif metni kontrol edilmelidir."
     )
 
 
@@ -408,7 +367,7 @@ def build_citizen_impact(summary: str, status_label: str, category: str) -> str:
     if status_label == "Komisyonda":
         base = (
             "Bu teklif şu anda komisyon aşamasındadır. "
-            "İçeriği komisyonda değişebilir, genişleyebilir veya daraltılabilir. "
+            "Bu yüzden içerik komisyonda değişebilir, genişleyebilir veya daraltılabilir. "
         )
     elif status_label == "Genel Kurul Gündeminde":
         base = (
@@ -438,13 +397,15 @@ def build_citizen_impact(summary: str, status_label: str, category: str) -> str:
         return (
             base
             + "Eğitim alanındaki düzenlemeler öğrencileri, mezunları, velileri veya yükseköğretim kurumlarını etkileyebilir. "
-            "Kesin ve bağlayıcı bilgi için resmî metin kontrol edilmelidir."
+            "Teklif kabul edilirse bazı öğrenciler için yeni haklar veya başvuru imkânları doğabilir. "
+            "Ancak kesin sonuç için resmî metin ve TBMM süreci kontrol edilmelidir."
         )
 
     if "çalışma" in category_text or "calisma" in category_text or "sosyal politika" in category_text:
         return (
             base
             + "Çalışma hayatı ve sosyal politika alanındaki düzenlemeler çalışanları, işverenleri, ücret politikalarını veya sosyal hakları etkileyebilir. "
+            "Teklif kabul edilirse iş hayatındaki hak ve yükümlülüklerde değişiklikler olabilir. "
             "Kesin ve bağlayıcı bilgi için resmî metin kontrol edilmelidir."
         )
 
@@ -452,26 +413,40 @@ def build_citizen_impact(summary: str, status_label: str, category: str) -> str:
         return (
             base
             + "Ekonomi alanındaki düzenlemeler vatandaşların gelirleri, vergiler, işletmeler veya kamu bütçesi üzerinde etkiler doğurabilir. "
-            "Kesin ve bağlayıcı bilgi için resmî metin kontrol edilmelidir."
+            "Bu nedenle teklifin kimleri kapsadığı ve hangi şartları getirdiği resmî metinden kontrol edilmelidir."
         )
 
     if "sağlık" in category_text or "saglik" in category_text:
         return (
             base
             + "Sağlık alanındaki düzenlemeler hastalar, sağlık çalışanları, hastaneler veya sağlık hizmetlerine erişim üzerinde etkiler doğurabilir. "
-            "Kesin ve bağlayıcı bilgi için resmî metin kontrol edilmelidir."
+            "Uygulamadaki kesin sonuçlar için resmî metin incelenmelidir."
         )
 
     if "adalet" in category_text:
         return (
             base
             + "Adalet alanındaki düzenlemeler hak arama yollarını, mahkeme süreçlerini veya vatandaşların hukuki yükümlülüklerini etkileyebilir. "
-            "Kesin ve bağlayıcı bilgi için resmî metin kontrol edilmelidir."
+            "Bu nedenle teklifin kabul edilip edilmediği ve son hâli özellikle kontrol edilmelidir."
         )
 
     return (
         base
         + "Teklifin vatandaş üzerindeki kesin etkisi için resmî metin ve TBMM süreci birlikte değerlendirilmelidir."
+    )
+
+
+def build_detailed_explanation(title: str, summary: str, what_changes: str, citizen_impact: str, status_label: str, category: str) -> str:
+    if not summary:
+        return ""
+
+    return (
+        f"Bu teklifin konusu: {title}\n\n"
+        f"Kısa anlamı:\n{summary}\n\n"
+        f"Süreç durumu:\nTeklif şu anda \"{status_label}\" aşamasındadır. Bu aşamada teklifin içeriği TBMM sürecinde değişebilir.\n\n"
+        f"Değişiklik mantığı:\n{what_changes}\n\n"
+        f"Vatandaş açısından değerlendirme:\n{citizen_impact}\n\n"
+        "Not: Bu açıklama bilgilendirme amaçlıdır. Kesin ve bağlayıcı bilgi için TBMM’deki resmî teklif metni ve kaynak bağlantısı kontrol edilmelidir."
     )
 
 
@@ -526,6 +501,14 @@ def parse_new_tbmm_detail_page(url: str) -> dict | None:
 
     what_changes = build_what_changes(plain_summary, category)
     citizen_impact = build_citizen_impact(plain_summary, status_label, category)
+    detailed_explanation = build_detailed_explanation(
+        title,
+        plain_summary,
+        what_changes,
+        citizen_impact,
+        status_label,
+        category,
+    )
 
     return {
         "tbmmId": tbmm_id,
@@ -539,6 +522,7 @@ def parse_new_tbmm_detail_page(url: str) -> dict | None:
         "content": "",
         "whatChanges": what_changes,
         "citizenImpact": citizen_impact,
+        "detailedExplanation": detailed_explanation,
         "category": category,
         "status": status,
         "statusLabel": status_label,
@@ -577,7 +561,6 @@ def fetch_new_offers() -> list[dict]:
     result = list(unique.values())
 
     print(f"Total parsed new offers: {len(result)}")
-
     return result
 
 
@@ -599,6 +582,7 @@ def upsert_laws(db, offers: list[dict]):
             "content": offer.get("content", ""),
             "whatChanges": offer.get("whatChanges", ""),
             "citizenImpact": offer.get("citizenImpact", ""),
+            "detailedExplanation": offer.get("detailedExplanation", ""),
 
             "category": offer.get("category", "Genel"),
             "sourceUrl": offer.get("sourceUrl", ""),
