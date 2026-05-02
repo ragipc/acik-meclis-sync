@@ -1,8 +1,9 @@
 import os
 import re
 import time
+import unicodedata
 from datetime import datetime, timezone
-from urllib.parse import urlparse, urljoin, unquote
+from urllib.parse import urljoin, unquote
 
 import requests
 from bs4 import BeautifulSoup
@@ -21,8 +22,8 @@ DETAIL_URL_PATTERN = re.compile(
 )
 
 # TBMM yeni arama sayfası bazı durumlarda detay linklerini düz HTML olarak vermeyebiliyor.
-# Bu yüzden kamuya açık arama sonuçlarından da yeni TBMM detay linklerini keşfediyoruz.
-# Script yine TBMM detay sayfasını kaynak kabul eder; açıklamayı arama motorundan değil, TBMM sayfasından çeker.
+# Bu yüzden güvenilir başlangıç linkleri kullanıyoruz.
+# Script yine TBMM detay sayfasını kaynak kabul eder.
 SEED_DETAIL_URLS = [
     "https://www.tbmm.gov.tr/Yasama/KanunTeklifi/23ff85ec-c046-4811-ba19-019ae46eceeb",
     "https://www.tbmm.gov.tr/Yasama/KanunTeklifi/12d348f9-77ee-4f09-8b78-019a5e27521f",
@@ -33,6 +34,7 @@ SEED_DETAIL_URLS = [
     "https://www.tbmm.gov.tr/Yasama/KanunTeklifi/4535a07a-284a-4c58-95ba-019cd1574b73",
     "https://www.tbmm.gov.tr/Yasama/KanunTeklifi/99b8a756-ce26-4a72-8ec8-019c09ff8738",
 ]
+
 DISCOVERY_QUERIES = [
     'site:tbmm.gov.tr/Yasama/KanunTeklifi/ "KANUN TEKLİFİ BİLGİLERİ" "28 / 4"',
     'site:tbmm.gov.tr/Yasama/KanunTeklifi/ "Teklifin Özeti" "Başkanlığa Geliş Tarihi"',
@@ -42,7 +44,7 @@ DISCOVERY_QUERIES = [
 ]
 
 REQUEST_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; AcikMeclisBot/2.0; +https://github.com/)",
+    "User-Agent": "Mozilla/5.0 (compatible; AcikMeclisBot/2.1; +https://github.com/)",
     "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.7",
 }
 
@@ -62,6 +64,22 @@ def init_firestore():
 
 def clean_text(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
+
+
+def normalize_turkish_for_search(value: str) -> str:
+    """
+    TBMM sayfasından bazen 'Komi̇syonda' gibi birleşik Unicode gelebiliyor.
+    Bu fonksiyon arama/eşleştirme için metni güvenli hale getirir.
+    """
+    text = clean_text(value)
+    text = unicodedata.normalize("NFKC", text)
+
+    # Türkçe büyük İ küçük harfe çevrilince bazen i + combining dot oluyor.
+    text = text.replace("i̇", "i")
+    text = text.replace("İ", "i")
+    text = text.replace("I", "ı")
+
+    return text.lower()
 
 
 def request_text(url: str, timeout: int = 60, attempts: int = 3) -> str:
@@ -164,8 +182,10 @@ def discover_new_tbmm_detail_urls(max_urls: int = 40) -> list[str]:
 
     for url in urls:
         normalized = normalize_detail_url(url)
+
         if normalized in seen:
             continue
+
         if "/Yasama/KanunTeklifi/" not in normalized:
             continue
 
@@ -194,6 +214,7 @@ def extract_field(full_text: str, label: str, next_labels: list[str]) -> str:
         pattern = rf"{escaped_label}\s+(.*)$"
 
     match = re.search(pattern, full_text, flags=re.IGNORECASE | re.DOTALL)
+
     if not match:
         return ""
 
@@ -201,7 +222,7 @@ def extract_field(full_text: str, label: str, next_labels: list[str]) -> str:
 
 
 def map_status(status_text: str):
-    source = clean_text(status_text).lower()
+    source = normalize_turkish_for_search(status_text)
 
     if not source:
         return "teklif_edildi", "Teklif Edildi"
@@ -215,6 +236,12 @@ def map_status(status_text: str):
     if "gündemde" in source or "gundemde" in source:
         return "genel_kurul_gundeminde", "Genel Kurul Gündeminde"
 
+    if "görüşülüyor" in source or "gorusuluyor" in source:
+        return "genel_kurulda_gorusuluyor", "Genel Kurulda Görüşülüyor"
+
+    if "oylama" in source:
+        return "oylamasi_yapildi", "Oylaması Yapıldı"
+
     if "işlemde" in source or "islemde" in source:
         return "teklif_edildi", "Teklif Edildi"
 
@@ -224,50 +251,112 @@ def map_status(status_text: str):
     if "hükümsüz" in source or "hukumsuz" in source:
         return "reddedildi", "Hükümsüz"
 
-    if "reddedildi" in source or "kadük" in source or "kaduk" in source or "düştü" in source:
+    if (
+        "reddedildi" in source
+        or "kadük" in source
+        or "kaduk" in source
+        or "düştü" in source
+        or "dustu" in source
+    ):
         return "reddedildi", "Reddedildi / Düştü / Kadük"
 
-    return "teklif_edildi", status_text.title() if status_text else "Teklif Edildi"
+    return "teklif_edildi", "Teklif Edildi"
 
 
 def infer_category(title: str, summary: str) -> str:
-    text = f"{title} {summary}".lower()
+    text = normalize_turkish_for_search(f"{title} {summary}")
 
-    if any(x in text for x in ["eğitim", "öğrenim", "okul", "üniversite", "yükseköğretim", "öğrenci", "öğretmen"]):
+    if any(x in text for x in ["eğitim", "egitim", "öğrenim", "ogrenim", "okul", "üniversite", "universite", "yükseköğretim", "yuksekogretim", "öğrenci", "ogrenci", "öğretmen", "ogretmen"]):
         return "Eğitim"
 
-    if any(x in text for x in ["vergi", "asgari ücret", "ekonomi", "bütçe", "emekli", "aylık", "işveren", "destek", "ticaret"]):
+    if any(x in text for x in ["vergi", "asgari ücret", "asgari ucret", "ekonomi", "bütçe", "butce", "emekli", "aylık", "aylik", "işveren", "isveren", "destek", "ticaret"]):
         return "Ekonomi"
 
-    if any(x in text for x in ["sağlık", "hastane", "ilaç", "malullük", "sosyal güvenlik", "genel sağlık"]):
+    if any(x in text for x in ["sağlık", "saglik", "hastane", "ilaç", "ilac", "malullük", "malulluk", "sosyal güvenlik", "sosyal guvenlik", "genel sağlık", "genel saglik"]):
         return "Sağlık"
 
-    if any(x in text for x in ["ceza", "mahkeme", "hukuk", "adalet", "avukat", "suç", "yargı"]):
+    if any(x in text for x in ["ceza", "mahkeme", "hukuk", "adalet", "avukat", "suç", "suc", "yargı", "yargi"]):
         return "Adalet"
 
-    if any(x in text for x in ["tarım", "orman", "hayvancılık", "çiftçi"]):
+    if any(x in text for x in ["tarım", "tarim", "orman", "hayvancılık", "hayvancilik", "çiftçi", "ciftci"]):
         return "Tarım"
 
-    if any(x in text for x in ["enerji", "maden", "elektrik", "doğalgaz"]):
+    if any(x in text for x in ["enerji", "maden", "elektrik", "doğalgaz", "dogalgaz"]):
         return "Enerji"
 
-    if any(x in text for x in ["ulaştırma", "trafik", "araç", "skuter", "haberleşme", "gsm"]):
+    if any(x in text for x in ["ulaştırma", "ulastirma", "trafik", "araç", "arac", "skuter", "haberleşme", "haberlesme", "gsm"]):
         return "Ulaşım / İletişim"
 
-    if any(x in text for x in ["çevre", "iklim", "imar", "şehir", "belediye"]):
+    if any(x in text for x in ["çevre", "cevre", "iklim", "imar", "şehir", "sehir", "belediye"]):
         return "Çevre / Şehircilik"
 
     return "Genel"
 
 
-def build_citizen_impact(summary: str, status_label: str) -> str:
+def build_citizen_impact(summary: str, status_label: str, category: str) -> str:
     if not summary:
         return ""
 
+    if status_label == "Komisyonda":
+        base = (
+            "Bu teklif şu anda komisyon aşamasındadır. "
+            "İçeriği komisyonda değişebilir, genişleyebilir veya daraltılabilir. "
+        )
+    elif status_label == "Genel Kurul Gündeminde":
+        base = (
+            "Bu teklif Genel Kurul gündemine gelmiş görünmektedir. "
+            "Bu aşama, teklifin Meclis genelinde görüşülmeye daha yakın olduğunu gösterir. "
+        )
+    elif status_label == "Kabul Edildi / Kanunlaştı":
+        base = (
+            "Bu teklif kabul edilmiş veya kanunlaşmış görünmektedir. "
+            "Bu nedenle ilgili vatandaşlar açısından uygulanabilir sonuçlar doğurabilir. "
+        )
+    elif status_label == "Yürürlüğe Girdi":
+        base = (
+            "Bu düzenleme yürürlüğe girmiş görünmektedir. "
+            "Bu nedenle vatandaşlar açısından doğrudan uygulanabilir sonuçlar doğurabilir. "
+        )
+    else:
+        base = (
+            f"Bu teklif {status_label.lower()} aşamasındadır. "
+            "Vatandaşı nasıl etkileyeceği, teklifin TBMM sürecinde değişip değişmemesine "
+            "ve kabul edilip edilmemesine bağlıdır. "
+        )
+
+    category_text = normalize_turkish_for_search(category)
+
+    if "eğitim" in category_text or "egitim" in category_text:
+        return (
+            base
+            + "Eğitim alanındaki düzenlemeler öğrencileri, mezunları, velileri veya yükseköğretim kurumlarını etkileyebilir. "
+            "Kesin ve bağlayıcı bilgi için resmî metin kontrol edilmelidir."
+        )
+
+    if "ekonomi" in category_text:
+        return (
+            base
+            + "Ekonomi alanındaki düzenlemeler vatandaşların gelirleri, vergiler, işletmeler veya kamu bütçesi üzerinde etkiler doğurabilir. "
+            "Kesin ve bağlayıcı bilgi için resmî metin kontrol edilmelidir."
+        )
+
+    if "sağlık" in category_text or "saglik" in category_text:
+        return (
+            base
+            + "Sağlık alanındaki düzenlemeler hastalar, sağlık çalışanları, hastaneler veya sağlık hizmetlerine erişim üzerinde etkiler doğurabilir. "
+            "Kesin ve bağlayıcı bilgi için resmî metin kontrol edilmelidir."
+        )
+
+    if "adalet" in category_text:
+        return (
+            base
+            + "Adalet alanındaki düzenlemeler hak arama yollarını, mahkeme süreçlerini veya vatandaşların hukuki yükümlülüklerini etkileyebilir. "
+            "Kesin ve bağlayıcı bilgi için resmî metin kontrol edilmelidir."
+        )
+
     return (
-        f"Bu teklif {status_label.lower()} aşamasındadır. "
-        "Vatandaşı nasıl etkileyeceği, teklifin TBMM sürecinde değişip değişmemesine "
-        "ve kabul edilip edilmemesine bağlıdır. Kesin ve bağlayıcı bilgi için resmî metin kontrol edilmelidir."
+        base
+        + "Teklifin vatandaş üzerindeki kesin etkisi için resmî metin ve TBMM süreci birlikte değerlendirilmelidir."
     )
 
 
@@ -340,6 +429,7 @@ def parse_new_tbmm_detail_page(url: str) -> dict | None:
     for a in soup.find_all("a", href=True):
         text = clean_text(a.get_text(" ", strip=True)).lower()
         href = a["href"].strip()
+
         if "kanun teklifinin metni" in text or href.lower().endswith(".pdf"):
             pdf_url = urljoin(TBMM_BASE_URL, href)
             break
@@ -356,7 +446,7 @@ def parse_new_tbmm_detail_page(url: str) -> dict | None:
     category = infer_category(title, plain_summary)
 
     what_changes = plain_summary
-    citizen_impact = build_citizen_impact(plain_summary, status_label)
+    citizen_impact = build_citizen_impact(plain_summary, status_label, category)
 
     return {
         "tbmmId": tbmm_id,
@@ -391,6 +481,7 @@ def fetch_new_offers() -> list[dict]:
     for url in urls:
         try:
             offer = parse_new_tbmm_detail_page(url)
+
             if offer:
                 offers.append(offer)
                 print(f"PARSED: {offer['tbmmId']} | {offer['title']} | {offer['statusLabel']}")
@@ -400,10 +491,12 @@ def fetch_new_offers() -> list[dict]:
         time.sleep(1)
 
     unique = {}
+
     for offer in offers:
         unique[offer["tbmmId"]] = offer
 
     result = list(unique.values())
+
     print(f"Total parsed new offers: {len(result)}")
 
     return result
