@@ -23,6 +23,16 @@ DETAIL_URL_PATTERN = re.compile(
 # TBMM yeni arama sayfası bazı durumlarda detay linklerini düz HTML olarak vermeyebiliyor.
 # Bu yüzden kamuya açık arama sonuçlarından da yeni TBMM detay linklerini keşfediyoruz.
 # Script yine TBMM detay sayfasını kaynak kabul eder; açıklamayı arama motorundan değil, TBMM sayfasından çeker.
+SEED_DETAIL_URLS = [
+    "https://www.tbmm.gov.tr/Yasama/KanunTeklifi/23ff85ec-c046-4811-ba19-019ae46eceeb",
+    "https://www.tbmm.gov.tr/Yasama/KanunTeklifi/12d348f9-77ee-4f09-8b78-019a5e27521f",
+    "https://www.tbmm.gov.tr/Yasama/KanunTeklifi/3a5fb0fa-a80a-4569-8801-019ac5230ca6",
+    "https://www.tbmm.gov.tr/Yasama/KanunTeklifi/8bf5742f-9144-41b3-9ec6-019c42d53ce0",
+    "https://www.tbmm.gov.tr/Yasama/KanunTeklifi/00558578-4e81-45e5-9d5f-019d6cefe046",
+    "https://www.tbmm.gov.tr/Yasama/KanunTeklifi/76c336f0-f27d-4ca0-a43e-019d9bbcaed2",
+    "https://www.tbmm.gov.tr/Yasama/KanunTeklifi/4535a07a-284a-4c58-95ba-019cd1574b73",
+    "https://www.tbmm.gov.tr/Yasama/KanunTeklifi/99b8a756-ce26-4a72-8ec8-019c09ff8738",
+]
 DISCOVERY_QUERIES = [
     'site:tbmm.gov.tr/Yasama/KanunTeklifi/ "KANUN TEKLİFİ BİLGİLERİ" "28 / 4"',
     'site:tbmm.gov.tr/Yasama/KanunTeklifi/ "Teklifin Özeti" "Başkanlığa Geliş Tarihi"',
@@ -138,8 +148,13 @@ def discover_from_bing(query: str) -> list[str]:
 def discover_new_tbmm_detail_urls(max_urls: int = 40) -> list[str]:
     urls = []
 
+    # 1) Güvenilir başlangıç linkleri
+    urls.extend(SEED_DETAIL_URLS)
+
+    # 2) TBMM sorgu sayfasından yakalanabilirse ekle
     urls.extend(discover_from_tbmm_search_page())
 
+    # 3) Arama motoru destek olarak kalsın; çalışmazsa sorun değil
     for query in DISCOVERY_QUERIES:
         urls.extend(discover_from_bing(query))
         time.sleep(1)
