@@ -19,7 +19,6 @@ DETAIL_URL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-
 SEED_DETAIL_URLS = [
     "https://www.tbmm.gov.tr/Yasama/KanunTeklifi/23ff85ec-c046-4811-ba19-019ae46eceeb",
     "https://www.tbmm.gov.tr/Yasama/KanunTeklifi/12d348f9-77ee-4f09-8b78-019a5e27521f",
@@ -40,7 +39,7 @@ DISCOVERY_QUERIES = [
 ]
 
 REQUEST_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; AcikMeclisBot/2.3; +https://github.com/)",
+    "User-Agent": "Mozilla/5.0 (compatible; AcikMeclisBot/2.4; +https://github.com/)",
     "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.7",
 }
 
@@ -565,12 +564,80 @@ def fetch_new_offers() -> list[dict]:
     return result
 
 
+def create_status_change_notifications(db, law_id: str, law_title: str, old_status: str, new_status: str, now):
+    """
+    Bir yasa teklifinin statusLabel değeri değişirse:
+    lawFollows koleksiyonunda bu yasayı takip eden kullanıcıları bulur
+    ve her kullanıcı için notifications kaydı oluşturur.
+    """
+    if not old_status or not new_status:
+        return
+
+    if old_status == new_status:
+        return
+
+    try:
+        follows = (
+            db.collection("lawFollows")
+            .where("lawId", "==", law_id)
+            .get()
+        )
+
+        if not follows:
+            print(f"NOTIFICATION SKIP: no followers for {law_id}")
+            return
+
+        batch = db.batch()
+        created_count = 0
+
+        for follow_doc in follows:
+            follow_data = follow_doc.to_dict() or {}
+            user_id = follow_data.get("userId", "")
+
+            if not user_id:
+                continue
+
+            notification_ref = db.collection("notifications").document()
+
+            batch.set(notification_ref, {
+                "userId": user_id,
+                "lawId": law_id,
+                "lawTitle": law_title,
+                "title": "Takip ettiğin teklifte gelişme var",
+                "message": f"“{law_title}” teklifi “{old_status}” aşamasından “{new_status}” aşamasına geçti.",
+                "type": "status_change",
+                "oldStatusLabel": old_status,
+                "newStatusLabel": new_status,
+                "isRead": False,
+                "createdAt": now,
+                "readAt": None,
+            })
+
+            created_count += 1
+
+        if created_count > 0:
+            batch.commit()
+            print(f"NOTIFICATIONS CREATED: {created_count} | {law_id} | {old_status} -> {new_status}")
+        else:
+            print(f"NOTIFICATION SKIP: followers found but no valid userId for {law_id}")
+
+    except Exception as e:
+        print(f"CREATE STATUS CHANGE NOTIFICATIONS ERROR for {law_id}: {e}")
+
+
 def upsert_laws(db, offers: list[dict]):
     now = datetime.now(timezone.utc)
 
     for offer in offers:
         doc_ref = db.collection("laws").document(offer["tbmmId"])
         existing = doc_ref.get()
+
+        old_status_label = ""
+        if existing.exists:
+            existing_data = existing.to_dict() or {}
+            old_status_label = existing_data.get("statusLabel", "") or ""
+
+        new_status_label = offer.get("statusLabel", "Teklif Edildi")
 
         payload = {
             "tbmmId": offer.get("tbmmId", ""),
@@ -590,7 +657,7 @@ def upsert_laws(db, offers: list[dict]):
             "pdfUrl": offer.get("pdfUrl", ""),
 
             "status": offer.get("status", "teklif_edildi"),
-            "statusLabel": offer.get("statusLabel", "Teklif Edildi"),
+            "statusLabel": new_status_label,
             "lastStatusText": offer.get("lastStatusText", ""),
             "resultText": offer.get("resultText", ""),
 
@@ -610,6 +677,18 @@ def upsert_laws(db, offers: list[dict]):
 
         action = "UPDATED" if existing.exists else "CREATED"
         print(f"{action}: {offer['tbmmId']} | {payload['title']} | {payload['statusLabel']}")
+
+        # İlk kayıt oluşturulurken bildirim üretmeyelim.
+        # Sadece daha önce var olan teklifin statüsü değişirse bildirim üretelim.
+        if existing.exists and old_status_label and old_status_label != new_status_label:
+            create_status_change_notifications(
+                db=db,
+                law_id=offer["tbmmId"],
+                law_title=payload["title"],
+                old_status=old_status_label,
+                new_status=new_status_label,
+                now=now,
+            )
 
 
 def main():
