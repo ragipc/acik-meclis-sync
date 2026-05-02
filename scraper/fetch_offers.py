@@ -2,23 +2,38 @@ import os
 import re
 import time
 from datetime import datetime, timezone
-from urllib.parse import urlparse, parse_qs
-from io import BytesIO
+from urllib.parse import urlparse, urljoin, unquote
 
 import requests
 from bs4 import BeautifulSoup
-from pypdf import PdfReader
 import firebase_admin
 from firebase_admin import credentials, firestore
 
 
-TBMM_LIST_URLS = [
-    "https://www5.tbmm.gov.tr/develop/owa/tasari_teklif_sd.sorgu_sonuc?bulunan_kayit=3278&icerik_arama=&kullanici_id=18731517&metin_arama=&sonuc_sira=340&taksim_no=0",
-    "https://www.tbmm.gov.tr/develop/owa/tasari_teklif_sd.sorgu_sonuc?bulunan_kayit=3278&icerik_arama=&kullanici_id=18731517&metin_arama=&sonuc_sira=340&taksim_no=0",
+TBMM_BASE_URL = "https://www.tbmm.gov.tr"
+TBMM_NEW_SEARCH_PAGE = "https://www.tbmm.gov.tr/yasama/kanun-teklifleri"
+
+# Yeni TBMM detay sayfaları şu yapıdadır:
+# https://www.tbmm.gov.tr/Yasama/KanunTeklifi/<uuid>
+DETAIL_URL_PATTERN = re.compile(
+    r"https?://(?:www\.)?tbmm\.gov\.tr/Yasama/KanunTeklifi/[a-zA-Z0-9-]+",
+    re.IGNORECASE,
+)
+
+# TBMM yeni arama sayfası bazı durumlarda detay linklerini düz HTML olarak vermeyebiliyor.
+# Bu yüzden kamuya açık arama sonuçlarından da yeni TBMM detay linklerini keşfediyoruz.
+# Script yine TBMM detay sayfasını kaynak kabul eder; açıklamayı arama motorundan değil, TBMM sayfasından çeker.
+DISCOVERY_QUERIES = [
+    'site:tbmm.gov.tr/Yasama/KanunTeklifi/ "KANUN TEKLİFİ BİLGİLERİ" "28 / 4"',
+    'site:tbmm.gov.tr/Yasama/KanunTeklifi/ "Teklifin Özeti" "Başkanlığa Geliş Tarihi"',
+    'site:tbmm.gov.tr/Yasama/KanunTeklifi/ "Son Durumu" "KOMİSYONDA"',
+    'site:tbmm.gov.tr/Yasama/KanunTeklifi/ "Son Durumu" "GÜNDEMDE"',
+    'site:tbmm.gov.tr/Yasama/KanunTeklifi/ "Son Durumu" "KANUNLAŞTI"',
 ]
 
 REQUEST_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; AcikMeclisBot/1.0)"
+    "User-Agent": "Mozilla/5.0 (compatible; AcikMeclisBot/2.0; +https://github.com/)",
+    "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.7",
 }
 
 
@@ -35,18 +50,23 @@ def init_firestore():
     return firestore.client()
 
 
-def request_with_retry(url: str, timeout: int = 60, attempts: int = 3) -> str:
+def clean_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def request_text(url: str, timeout: int = 60, attempts: int = 3) -> str:
     last_error = None
 
     for attempt in range(1, attempts + 1):
         try:
             print(f"Requesting: {url} | attempt {attempt}")
-            response = requests.get(
-                url,
-                timeout=timeout,
-                headers=REQUEST_HEADERS,
-            )
+            response = requests.get(url, timeout=timeout, headers=REQUEST_HEADERS)
             response.raise_for_status()
+
+            # TBMM sayfalarında Türkçe karakterler için requests bazen tahmin hatası yapabiliyor.
+            if not response.encoding or response.encoding.lower() == "iso-8859-1":
+                response.encoding = response.apparent_encoding or "utf-8"
+
             return response.text
         except requests.RequestException as e:
             last_error = e
@@ -56,415 +76,383 @@ def request_with_retry(url: str, timeout: int = 60, attempts: int = 3) -> str:
     raise RuntimeError(f"Request failed for {url}. Last error: {last_error}")
 
 
-def fetch_binary_with_retry(url: str, timeout: int = 90, attempts: int = 3) -> bytes:
-    last_error = None
+def normalize_detail_url(url: str) -> str:
+    url = unquote(url)
+    url = url.split("&")[0]
+    url = url.split("?")[0]
+    url = url.replace("http://", "https://")
 
-    for attempt in range(1, attempts + 1):
-        try:
-            print(f"Downloading binary: {url} | attempt {attempt}")
-            response = requests.get(
-                url,
-                timeout=timeout,
-                headers=REQUEST_HEADERS,
-            )
-            response.raise_for_status()
-            return response.content
-        except requests.RequestException as e:
-            last_error = e
-            print(f"Binary request failed: {e}")
-            time.sleep(3)
+    # tbmm.gov.tr -> www.tbmm.gov.tr standardı
+    url = url.replace("https://tbmm.gov.tr/", "https://www.tbmm.gov.tr/")
 
-    raise RuntimeError(f"Binary download failed for {url}. Last error: {last_error}")
+    return url.strip()
 
 
-def fetch_tbmm_list():
-    last_error = None
+def extract_detail_urls_from_html(html: str) -> list[str]:
+    urls = set()
 
-    for url in TBMM_LIST_URLS:
-        try:
-            print(f"Trying list URL: {url}")
-            html = request_with_retry(url, timeout=60, attempts=3)
-            print(f"Success with list URL: {url}")
-            return html
-        except Exception as e:
-            last_error = e
-            print(f"List URL failed: {e}")
+    # 1) Direkt regex ile yakala
+    for match in DETAIL_URL_PATTERN.findall(html):
+        urls.add(normalize_detail_url(match))
 
-    raise RuntimeError(f"All list URLs failed. Last error: {last_error}")
+    # 2) Anchor href üzerinden yakala
+    soup = BeautifulSoup(html, "html.parser")
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        absolute = urljoin(TBMM_BASE_URL, href)
 
+        if "/Yasama/KanunTeklifi/" in absolute:
+            urls.add(normalize_detail_url(absolute))
 
-def normalize_url(href: str):
-    if href.startswith("http"):
-        return href
-    if href.startswith("/"):
-        return f"https://www5.tbmm.gov.tr{href}"
-    return f"https://www5.tbmm.gov.tr/{href}"
+    return sorted(urls)
 
 
-def clean_text(value: str):
-    return re.sub(r"\s+", " ", value).strip()
+def discover_from_tbmm_search_page() -> list[str]:
+    try:
+        html = request_text(TBMM_NEW_SEARCH_PAGE, attempts=2)
+        urls = extract_detail_urls_from_html(html)
+        print(f"TBMM search page discovered detail URLs: {len(urls)}")
+        return urls
+    except Exception as e:
+        print(f"TBMM search page discovery warning: {e}")
+        return []
 
 
-def extract_kanunlar_sira_no(url: str):
-    parsed = urlparse(url)
-    query = parse_qs(parsed.query)
-    values = query.get("kanunlar_sira_no")
-    if values and values[0].strip():
-        return values[0].strip()
-    return None
+def discover_from_bing(query: str) -> list[str]:
+    """
+    TBMM'nin yeni sorgu formu her zaman düz HTML sonuç vermediği için
+    kamuya açık arama sonucu sadece URL keşfi için kullanılır.
+    Veri yine TBMM detay sayfasından çekilir.
+    """
+    try:
+        search_url = "https://www.bing.com/search?q=" + requests.utils.quote(query)
+        html = request_text(search_url, timeout=60, attempts=2)
+        urls = extract_detail_urls_from_html(html)
+        print(f"Bing discovery for query [{query}] -> {len(urls)} URLs")
+        return urls
+    except Exception as e:
+        print(f"Bing discovery warning for query [{query}]: {e}")
+        return []
 
 
-def map_status(last_status_text: str):
-    source = clean_text(last_status_text).lower()
+def discover_new_tbmm_detail_urls(max_urls: int = 40) -> list[str]:
+    urls = []
+
+    urls.extend(discover_from_tbmm_search_page())
+
+    for query in DISCOVERY_QUERIES:
+        urls.extend(discover_from_bing(query))
+        time.sleep(1)
+
+    unique = []
+    seen = set()
+
+    for url in urls:
+        normalized = normalize_detail_url(url)
+        if normalized in seen:
+            continue
+        if "/Yasama/KanunTeklifi/" not in normalized:
+            continue
+
+        seen.add(normalized)
+        unique.append(normalized)
+
+    print(f"Total unique new TBMM detail URLs discovered: {len(unique)}")
+
+    return unique[:max_urls]
+
+
+def extract_field(full_text: str, label: str, next_labels: list[str]) -> str:
+    """
+    TBMM detay sayfasında metin şu şekilde geliyor:
+    Teklifin Başlığı ...
+    Teklifin Özeti ...
+    Son Durumu ...
+    Bu fonksiyon label ile sonraki label arasını alır.
+    """
+    escaped_label = re.escape(label)
+
+    if next_labels:
+        next_part = "|".join(re.escape(x) for x in next_labels)
+        pattern = rf"{escaped_label}\s+(.*?)(?=\s+(?:{next_part})\s+|$)"
+    else:
+        pattern = rf"{escaped_label}\s+(.*)$"
+
+    match = re.search(pattern, full_text, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return ""
+
+    return clean_text(match.group(1))
+
+
+def map_status(status_text: str):
+    source = clean_text(status_text).lower()
 
     if not source:
         return "teklif_edildi", "Teklif Edildi"
 
+    if "kanunlaştı" in source or "kanunlasti" in source:
+        return "kabul_edildi", "Kabul Edildi / Kanunlaştı"
+
     if "komisyonda" in source:
         return "komisyonda", "Komisyonda"
 
-    if "komisyon raporu" in source or "raporu" in source:
-        return "komisyon_raporu_hazir", "Komisyon Raporu Hazır"
-
-    if "genel kurul gündeminde" in source or "gündemde" in source:
+    if "gündemde" in source or "gundemde" in source:
         return "genel_kurul_gundeminde", "Genel Kurul Gündeminde"
 
-    if "genel kurulda görüşül" in source or "görüşülüyor" in source:
-        return "genel_kurulda_gorusuluyor", "Genel Kurulda Görüşülüyor"
+    if "işlemde" in source or "islemde" in source:
+        return "teklif_edildi", "Teklif Edildi"
 
-    if "oylama" in source:
-        return "oylamasi_yapildi", "Oylaması Yapıldı"
+    if "geri alındı" in source or "geri alindi" in source:
+        return "reddedildi", "Geri Alındı"
 
-    if "kanunlaştı" in source or "kabul edildi" in source or "kabul edilmiştir" in source:
-        return "kabul_edildi", "Kabul Edildi / Kanunlaştı"
+    if "hükümsüz" in source or "hukumsuz" in source:
+        return "reddedildi", "Hükümsüz"
 
-    if "yürürlüğe girdi" in source or "resmi gazete" in source:
-        return "yururluge_girdi", "Yürürlüğe Girdi"
-
-    if "reddedildi" in source or "kadük" in source or "düştü" in source:
+    if "reddedildi" in source or "kadük" in source or "kaduk" in source or "düştü" in source:
         return "reddedildi", "Reddedildi / Düştü / Kadük"
 
-    return "teklif_edildi", "Teklif Edildi"
+    return "teklif_edildi", status_text.title() if status_text else "Teklif Edildi"
 
 
-def try_extract_date(text: str):
-    match = re.search(r"\b(\d{1,2}[./]\d{1,2}[./]\d{2,4})\b", text)
-    return match.group(1) if match else ""
+def infer_category(title: str, summary: str) -> str:
+    text = f"{title} {summary}".lower()
+
+    if any(x in text for x in ["eğitim", "öğrenim", "okul", "üniversite", "yükseköğretim", "öğrenci", "öğretmen"]):
+        return "Eğitim"
+
+    if any(x in text for x in ["vergi", "asgari ücret", "ekonomi", "bütçe", "emekli", "aylık", "işveren", "destek", "ticaret"]):
+        return "Ekonomi"
+
+    if any(x in text for x in ["sağlık", "hastane", "ilaç", "malullük", "sosyal güvenlik", "genel sağlık"]):
+        return "Sağlık"
+
+    if any(x in text for x in ["ceza", "mahkeme", "hukuk", "adalet", "avukat", "suç", "yargı"]):
+        return "Adalet"
+
+    if any(x in text for x in ["tarım", "orman", "hayvancılık", "çiftçi"]):
+        return "Tarım"
+
+    if any(x in text for x in ["enerji", "maden", "elektrik", "doğalgaz"]):
+        return "Enerji"
+
+    if any(x in text for x in ["ulaştırma", "trafik", "araç", "skuter", "haberleşme", "gsm"]):
+        return "Ulaşım / İletişim"
+
+    if any(x in text for x in ["çevre", "iklim", "imar", "şehir", "belediye"]):
+        return "Çevre / Şehircilik"
+
+    return "Genel"
 
 
-def extract_status_from_text(block_text: str):
-    patterns = [
-        r"Son Durumu\s*:?\s*(.+?)(?:Esas Numarası|Başkanlığa Geliş Tarihi|$)",
-        r"Son Durumu\s+(.+?)(?:Esas Numarası|Başkanlığa Geliş Tarihi|$)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, block_text, flags=re.IGNORECASE)
-        if match:
-            return clean_text(match.group(1))
-    return ""
-
-
-def extract_esas_no_from_text(block_text: str):
-    patterns = [
-        r"Esas Numarası\s*:?\s*([0-9/ -]+)",
-        r"Esas No\s*:?\s*([0-9/ -]+)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, block_text, flags=re.IGNORECASE)
-        if match:
-            return clean_text(match.group(1))
-    return ""
-
-
-def pick_title_from_lines(lines):
-    bad_fragments = [
-        "diğer bilgiler",
-        "metni",
-        "yazıcı dostu",
-        "sonraki",
-        "önceki",
-        "esas numarası",
-        "başkanlığa geliş tarihi",
-        "son durumu",
-    ]
-
-    candidates = []
-    for line in lines:
-        t = clean_text(line)
-        if not t:
-            continue
-
-        lower = t.lower()
-
-        if any(bad in lower for bad in bad_fragments):
-            continue
-
-        if len(t) < 10:
-            continue
-
-        if re.fullmatch(r"[0-9/ .-]+", t):
-            continue
-
-        candidates.append(t)
-
-    if not candidates:
+def build_citizen_impact(summary: str, status_label: str) -> str:
+    if not summary:
         return ""
 
-    candidates.sort(key=len, reverse=True)
-    return candidates[0]
+    return (
+        f"Bu teklif {status_label.lower()} aşamasındadır. "
+        "Vatandaşı nasıl etkileyeceği, teklifin TBMM sürecinde değişip değişmemesine "
+        "ve kabul edilip edilmemesine bağlıdır. Kesin ve bağlayıcı bilgi için resmî metin kontrol edilmelidir."
+    )
 
 
-def extract_pdf_from_container(container):
-    for a in container.find_all("a", href=True):
-        href = a["href"].strip()
-        text = clean_text(a.get_text(" ", strip=True)).lower()
-
-        if href.lower().endswith(".pdf") or "metni" in text:
-            return normalize_url(href)
-    return ""
-
-
-def parse_basic_offers(html: str):
+def parse_new_tbmm_detail_page(url: str) -> dict | None:
+    html = request_text(url, attempts=3)
     soup = BeautifulSoup(html, "html.parser")
+
+    full_text = clean_text(soup.get_text(" ", strip=True))
+
+    if "KANUN TEKLİFİ BİLGİLERİ" not in full_text and "Teklifin Başlığı" not in full_text:
+        print(f"Skipping non-detail page: {url}")
+        return None
+
+    labels = [
+        "Kanun Teklifinin Metni",
+        "Dönemi ve Yasama Yılı",
+        "Esas Numarası",
+        "Başkanlığa Geliş Tarihi",
+        "Teklifin Başlığı",
+        "Teklifin Özeti",
+        "Son Durumu",
+        "Teklifin Sonucu",
+        "KANUN TEKLİFİ KOMİSYON BİLGİLERİ",
+        "KANUN TEKLİFİ İMZA SAHİPLERİ",
+    ]
+
+    donem_yasama = extract_field(
+        full_text,
+        "Dönemi ve Yasama Yılı",
+        labels[2:],
+    )
+
+    esas_no = extract_field(
+        full_text,
+        "Esas Numarası",
+        labels[3:],
+    )
+
+    submitted_at_text = extract_field(
+        full_text,
+        "Başkanlığa Geliş Tarihi",
+        labels[4:],
+    )
+
+    official_title = extract_field(
+        full_text,
+        "Teklifin Başlığı",
+        labels[5:],
+    )
+
+    plain_summary = extract_field(
+        full_text,
+        "Teklifin Özeti",
+        labels[6:],
+    )
+
+    last_status_text = extract_field(
+        full_text,
+        "Son Durumu",
+        labels[7:],
+    )
+
+    result_text = extract_field(
+        full_text,
+        "Teklifin Sonucu",
+        labels[8:],
+    )
+
+    pdf_url = ""
+    for a in soup.find_all("a", href=True):
+        text = clean_text(a.get_text(" ", strip=True)).lower()
+        href = a["href"].strip()
+        if "kanun teklifinin metni" in text or href.lower().endswith(".pdf"):
+            pdf_url = urljoin(TBMM_BASE_URL, href)
+            break
+
+    status, status_label = map_status(last_status_text or result_text)
+
+    # UUID detay URL'den alınır.
+    detail_id = url.rstrip("/").split("/")[-1]
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", detail_id)
+    tbmm_id = f"tbmm_new_{safe_id}"
+
+    title = official_title or f"TBMM Kanun Teklifi {esas_no or safe_id}"
+
+    category = infer_category(title, plain_summary)
+
+    what_changes = plain_summary
+    citizen_impact = build_citizen_impact(plain_summary, status_label)
+
+    return {
+        "tbmmId": tbmm_id,
+        "sourceSystem": "tbmm_new",
+        "sourceUrl": normalize_detail_url(url),
+        "pdfUrl": pdf_url,
+        "title": title,
+        "officialTitle": official_title or title,
+        "summary": plain_summary,
+        "plainSummary": plain_summary,
+        "content": "",
+        "whatChanges": what_changes,
+        "citizenImpact": citizen_impact,
+        "category": category,
+        "status": status,
+        "statusLabel": status_label,
+        "lastStatusText": last_status_text,
+        "resultText": result_text,
+        "esasNo": esas_no,
+        "donemYasama": donem_yasama,
+        "submittedAtText": submitted_at_text,
+        "isActive": True,
+        "createdBy": "tbmm_sync_bot",
+    }
+
+
+def fetch_new_offers() -> list[dict]:
+    urls = discover_new_tbmm_detail_urls(max_urls=40)
+
     offers = []
 
-    all_links = soup.find_all("a", href=True)
-    print("Total <a> tags found:", len(all_links))
+    for url in urls:
+        try:
+            offer = parse_new_tbmm_detail_page(url)
+            if offer:
+                offers.append(offer)
+                print(f"PARSED: {offer['tbmmId']} | {offer['title']} | {offer['statusLabel']}")
+        except Exception as e:
+            print(f"DETAIL PARSE WARNING for {url}: {e}")
 
-    for a in all_links:
-        href = a["href"].strip()
-
-        if "tasari_teklif_sd.onerge_bilgileri" not in href.lower():
-            continue
-
-        kanunlar_sira_no = extract_kanunlar_sira_no(href)
-        if not kanunlar_sira_no:
-            continue
-
-        detail_url = normalize_url(href)
-
-        container = a.find_parent("tr")
-        if container is None:
-            container = a.find_parent("table")
-        if container is None:
-            container = a.parent
-
-        block_text = clean_text(container.get_text("\n", strip=True)) if container else ""
-        lines = [clean_text(x) for x in block_text.split("\n") if clean_text(x)]
-
-        title = pick_title_from_lines(lines)
-        last_status_text = extract_status_from_text(block_text)
-        esas_no = extract_esas_no_from_text(block_text)
-        submitted_at_text = try_extract_date(block_text)
-        pdf_url = extract_pdf_from_container(container) if container else ""
-
-        status, status_label = map_status(last_status_text)
-
-        if not title:
-            title = f"TBMM Kanun Teklifi {kanunlar_sira_no}"
-
-        summary = last_status_text if last_status_text else ""
-
-        offers.append({
-            "tbmmId": f"tbmm_{kanunlar_sira_no}",
-            "kanunlarSiraNo": kanunlar_sira_no,
-            "esasNo": esas_no,
-            "title": title,
-            "summary": summary,
-            "sourceUrl": detail_url,
-            "pdfUrl": pdf_url,
-            "submittedAtText": submitted_at_text,
-            "lastStatusText": last_status_text,
-            "status": status,
-            "statusLabel": status_label,
-        })
+        time.sleep(1)
 
     unique = {}
-    for item in offers:
-        unique[item["tbmmId"]] = item
+    for offer in offers:
+        unique[offer["tbmmId"]] = offer
 
     result = list(unique.values())
-
-    print(f"Found filtered offers: {len(result)}")
-    if result:
-        print("Sample offers:")
-        for item in result[:10]:
-            print(
-                f"- {item['tbmmId']} | {item['title']} | {item['statusLabel']} | {item['sourceUrl']}"
-            )
+    print(f"Total parsed new offers: {len(result)}")
 
     return result
 
 
-def extract_text_from_pdf(pdf_url: str):
-    if not pdf_url:
-        return ""
-
-    try:
-        pdf_bytes = fetch_binary_with_retry(pdf_url, timeout=90, attempts=2)
-        reader = PdfReader(BytesIO(pdf_bytes))
-        text_parts = []
-
-        # İlk 2 sayfa çoğu zaman yeterli
-        page_count = min(2, len(reader.pages))
-        for i in range(page_count):
-            try:
-                page_text = reader.pages[i].extract_text() or ""
-                if page_text.strip():
-                    text_parts.append(page_text)
-            except Exception as e:
-                print(f"PDF page extract error ({pdf_url}, page {i}): {e}")
-
-        text = "\n".join(text_parts)
-        return clean_text(text)
-    except Exception as e:
-        print(f"PDF extract failed for {pdf_url}: {e}")
-        return ""
-
-
-def parse_pdf_fields(pdf_text: str):
-    if not pdf_text:
-        return {
-            "pdfTitle": "",
-            "pdfSubmittedAtText": "",
-            "pdfEsasNo": "",
-        }
-
-    lines = [clean_text(x) for x in pdf_text.split("\n") if clean_text(x)]
-
-    # Başlık için ilk güçlü satırlardan birini seç
-    pdf_title = ""
-    for line in lines[:20]:
-        lower = line.lower()
-
-        if len(line) < 15:
-            continue
-        if "türkiye büyük millet meclisi" in lower:
-            continue
-        if "kanun teklifi" in lower and len(line) < 25:
-            continue
-        if "esas no" in lower or "başkanlığa geliş tarihi" in lower:
-            continue
-
-        pdf_title = line
-        break
-
-    pdf_submitted = ""
-    for line in lines[:40]:
-        if "başkanlığa geliş tarihi" in line.lower():
-            maybe_date = try_extract_date(line)
-            if maybe_date:
-                pdf_submitted = maybe_date
-                break
-
-    pdf_esas_no = ""
-    for line in lines[:40]:
-        if "esas no" in line.lower() or "esas numarası" in line.lower():
-            m = re.search(r"([0-9/ -]+)", line)
-            if m:
-                pdf_esas_no = clean_text(m.group(1))
-                break
-
-    return {
-        "pdfTitle": pdf_title,
-        "pdfSubmittedAtText": pdf_submitted,
-        "pdfEsasNo": pdf_esas_no,
-    }
-
-
-def enrich_offer_with_detail_page(offer: dict):
-    try:
-        detail_html = request_with_retry(offer["sourceUrl"], timeout=60, attempts=2)
-        soup = BeautifulSoup(detail_html, "html.parser")
-
-        if not offer.get("pdfUrl"):
-            for a in soup.find_all("a", href=True):
-                href = a["href"].strip()
-                text = clean_text(a.get_text(" ", strip=True)).lower()
-                if href.lower().endswith(".pdf") or "metni" in text:
-                    offer["pdfUrl"] = normalize_url(href)
-                    break
-
-        return offer
-    except Exception as e:
-        print(f"DETAIL PAGE WARNING for {offer['tbmmId']}: {e}")
-        return offer
-
-
-def apply_pdf_enrichment(offer: dict):
-    pdf_url = offer.get("pdfUrl", "")
-    if not pdf_url:
-        return offer
-
-    pdf_text = extract_text_from_pdf(pdf_url)
-    pdf_fields = parse_pdf_fields(pdf_text)
-
-    # Başlık generic ise PDF başlığını tercih et
-    current_title = offer.get("title", "")
-    if current_title.startswith("TBMM Kanun Teklifi") and pdf_fields["pdfTitle"]:
-        offer["title"] = pdf_fields["pdfTitle"]
-
-    if not offer.get("submittedAtText") and pdf_fields["pdfSubmittedAtText"]:
-        offer["submittedAtText"] = pdf_fields["pdfSubmittedAtText"]
-
-    if not offer.get("esasNo") and pdf_fields["pdfEsasNo"]:
-        offer["esasNo"] = pdf_fields["pdfEsasNo"]
-
-    # Özet boşsa PDF ilk 400 karakterden kısa özet üret
-    if not offer.get("summary") and pdf_text:
-        offer["summary"] = pdf_text[:400]
-
-    return offer
-
-
-def upsert_laws(db, offers):
+def upsert_laws(db, offers: list[dict]):
     now = datetime.now(timezone.utc)
 
     for offer in offers:
-        enriched = enrich_offer_with_detail_page(offer)
-        enriched = apply_pdf_enrichment(enriched)
-
-        doc_ref = db.collection("laws").document(enriched["tbmmId"])
+        doc_ref = db.collection("laws").document(offer["tbmmId"])
         existing = doc_ref.get()
 
         payload = {
-            "tbmmId": enriched["tbmmId"],
-            "kanunlarSiraNo": enriched.get("kanunlarSiraNo", ""),
-            "esasNo": enriched.get("esasNo", ""),
-            "title": enriched.get("title", ""),
-            "summary": enriched.get("summary", ""),
-            "content": "",
-            "category": "Genel",
-            "sourceUrl": enriched.get("sourceUrl", ""),
-            "pdfUrl": enriched.get("pdfUrl", ""),
-            "submittedAtText": enriched.get("submittedAtText", ""),
-            "lastStatusText": enriched.get("lastStatusText", ""),
-            "status": enriched.get("status", "teklif_edildi"),
-            "statusLabel": enriched.get("statusLabel", "Teklif Edildi"),
-            "publishedAt": now,
+            "tbmmId": offer.get("tbmmId", ""),
+            "sourceSystem": offer.get("sourceSystem", "tbmm_new"),
+
+            "title": offer.get("title", ""),
+            "officialTitle": offer.get("officialTitle", ""),
+            "summary": offer.get("summary", ""),
+            "plainSummary": offer.get("plainSummary", ""),
+            "content": offer.get("content", ""),
+            "whatChanges": offer.get("whatChanges", ""),
+            "citizenImpact": offer.get("citizenImpact", ""),
+
+            "category": offer.get("category", "Genel"),
+            "sourceUrl": offer.get("sourceUrl", ""),
+            "pdfUrl": offer.get("pdfUrl", ""),
+
+            "status": offer.get("status", "teklif_edildi"),
+            "statusLabel": offer.get("statusLabel", "Teklif Edildi"),
+            "lastStatusText": offer.get("lastStatusText", ""),
+            "resultText": offer.get("resultText", ""),
+
+            "esasNo": offer.get("esasNo", ""),
+            "donemYasama": offer.get("donemYasama", ""),
+            "submittedAtText": offer.get("submittedAtText", ""),
+
             "lastSyncedAt": now,
             "isActive": True,
             "createdBy": "tbmm_sync_bot",
         }
 
-        if existing.exists:
-            doc_ref.set(payload, merge=True)
-            print(f"UPDATED: {enriched['tbmmId']} | {payload['title']} | {payload['statusLabel']}")
-        else:
-            doc_ref.set(payload)
-            print(f"CREATED: {enriched['tbmmId']} | {payload['title']} | {payload['statusLabel']}")
+        # publishedAt ilk oluşturulduğu zamanı temsil etsin.
+        # Var olan kayıtta her sync'te değişmesin.
+        if not existing.exists:
+            payload["publishedAt"] = now
+
+        doc_ref.set(payload, merge=True)
+
+        action = "UPDATED" if existing.exists else "CREATED"
+        print(f"{action}: {offer['tbmmId']} | {payload['title']} | {payload['statusLabel']}")
 
 
 def main():
     db = init_firestore()
-    html = fetch_tbmm_list()
-    offers = parse_basic_offers(html)
+
+    offers = fetch_new_offers()
 
     if not offers:
-        print("No filtered offers found.")
+        print("No new TBMM offers found. Nothing to sync.")
         return
 
     upsert_laws(db, offers)
+
     print(f"Done. Total synced: {len(offers)}")
 
 
