@@ -19,6 +19,7 @@ DETAIL_URL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+
 SEED_DETAIL_URLS = [
     "https://www.tbmm.gov.tr/Yasama/KanunTeklifi/23ff85ec-c046-4811-ba19-019ae46eceeb",
     "https://www.tbmm.gov.tr/Yasama/KanunTeklifi/12d348f9-77ee-4f09-8b78-019a5e27521f",
